@@ -1,7 +1,7 @@
 {
-  "name": "374-selfbot",
+  "name": "discord-phish",
   "version": "1.0.0",
-  "scripts": {
-    "start": "npx serve -s . -l $PORT"
+  "dependencies": {
+    "express": "^4.18.2"
   }
 }
