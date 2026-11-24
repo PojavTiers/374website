@@ -1,8 +1,9 @@
+// automation/index.js
 'use strict';
 
 const crypto = require('node:crypto');
 const express = require('express');
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client } = require('discord.js-selfbot-v13');
 
 const PORT = Number(process.env.PORT || 3000);
 const SECRET = process.env.AUTOMATION_SHARED_SECRET;
@@ -36,8 +37,8 @@ async function kill(id) {
 }
 
 async function start(p) {
-  const { accountId, accessToken } = p;
-  if (!accountId || !accessToken) throw new Error('accountId and accessToken required');
+  const { accountId, token } = p;
+  if (!accountId || !token) throw new Error('accountId and token required');
 
   await kill(accountId);
 
@@ -50,14 +51,10 @@ async function start(p) {
   };
   sessions.set(accountId, rec);
 
-  const client = new Client({
-    intents: [GatewayIntentBits.Guilds],
-    presence: { status: 'online' },
-    rest: { timeout: 30000 },
-  });
+  const client = new Client({ checkUpdate: false, readyStatus: 'online' });
   rec.client = client;
 
-  client.once('ready', () => {
+  client.on('ready', () => {
     const l = sessions.get(accountId);
     if (!l) return;
     l.status = 'online';
@@ -80,12 +77,8 @@ async function start(p) {
     const l = sessions.get(accountId);
     if (l) { l.status = 'error'; l.error = String(err && err.message || err).slice(0, 300); }
   });
-  client.on('invalidated', () => {
-    const l = sessions.get(accountId);
-    if (l) { l.status = 'reauth_required'; l.error = 'Reconnect required'; }
-  });
 
-  await client.login(accessToken);
+  await client.login(token);
   return rec;
 }
 
