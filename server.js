@@ -1,3 +1,4 @@
+// server.js
 'use strict';
 
 const crypto = require('node:crypto');
@@ -16,8 +17,7 @@ const SESSION_TTL_DAYS = Number(env.SESSION_TTL_DAYS || 14);
 const MAX_ACCOUNTS = Number(env.MAX_ACCOUNTS_PER_USER || 10);
 const COOKIE = 'dd_sid';
 
-const REQUIRED = ['DATABASE_URL', 'ENCRYPTION_KEY', 'DISCORD_CLIENT_ID',
-  'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI', 'AUTOMATION_BASE_URL',
+const REQUIRED = ['DATABASE_URL', 'ENCRYPTION_KEY', 'AUTOMATION_BASE_URL',
   'AUTOMATION_SHARED_SECRET'];
 
 const missing = REQUIRED.filter((k) => !env[k]);
@@ -69,24 +69,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
-CREATE TABLE IF NOT EXISTS oauth_states (
-  state TEXT PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  expires_at TIMESTAMPTZ NOT NULL
-);
 CREATE TABLE IF NOT EXISTS accounts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   discord_user_id TEXT NOT NULL,
   username TEXT NOT NULL,
   global_name TEXT,
-  discriminator TEXT,
   avatar_url TEXT,
-  scopes TEXT NOT NULL DEFAULT '',
   access_token_enc TEXT NOT NULL,
-  refresh_token_enc TEXT,
-  token_expires_at TIMESTAMPTZ,
   status TEXT NOT NULL DEFAULT 'connecting',
   last_error TEXT,
   last_checked_at TIMESTAMPTZ,
@@ -188,44 +178,9 @@ async function backend(method, path, body) {
 
 const API = 'https://discord.com/api/v10';
 
-async function exchange(code) {
-  const body = new URLSearchParams({
-    client_id: env.DISCORD_CLIENT_ID,
-    client_secret: env.DISCORD_CLIENT_SECRET,
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: env.DISCORD_REDIRECT_URI,
-  });
-  const res = await fetch(API + '/oauth2/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error('exchange_failed:' + res.status);
-  return res.json();
-}
-
-async function refreshToken(rt) {
-  const body = new URLSearchParams({
-    client_id: env.DISCORD_CLIENT_ID,
-    client_secret: env.DISCORD_CLIENT_SECRET,
-    grant_type: 'refresh_token',
-    refresh_token: rt,
-  });
-  const res = await fetch(API + '/oauth2/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error('refresh_failed:' + res.status);
-  return res.json();
-}
-
 async function me(token) {
   const res = await fetch(API + '/users/@me', {
-    headers: { authorization: 'Bearer ' + token },
+    headers: { authorization: token },
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error('user_failed:' + res.status);
@@ -325,40 +280,16 @@ async function owned(userId, id) {
   return db.one('SELECT * FROM accounts WHERE id = $1 AND user_id = $2', [id, userId]);
 }
 
-async function freshToken(acc) {
-  const exp = acc.token_expires_at ? new Date(acc.token_expires_at).getTime() : 0;
-  if (exp && exp - Date.now() > 120000) return acc;
-  const rt = decrypt(acc.refresh_token_enc);
-  if (!rt) return acc;
-  try {
-    const t = await refreshToken(rt);
-    const newExp = new Date(Date.now() + Number(t.expires_in || 604800) * 1000);
-    const upd = await db.one(
-      'UPDATE accounts SET access_token_enc=$1, refresh_token_enc=$2, token_expires_at=$3, updated_at=now() WHERE id=$4 RETURNING *',
-      [encrypt(t.access_token), encrypt(t.refresh_token || rt), newExp, acc.id]
-    );
-    if (upd) {
-      await backend('POST', '/internal/accounts/connect', {
-        accountId: upd.id, accessToken: t.access_token, tokenExpiresAt: newExp.toISOString(),
-      });
-      return upd;
-    }
-    return acc;
-  } catch {
-    await db.q("UPDATE accounts SET status='reauth_required', last_error='Session expired - reconnect required', last_status_change=now() WHERE id=$1", [acc.id]);
-    return { ...acc, status: 'reauth_required' };
-  }
-}
-
 async function sync(acc) {
-  const a = await freshToken(acc);
-  const r = await backend('GET', '/internal/accounts/' + encodeURIComponent(a.id) + '/status');
+  const r = await backend('GET', '/internal/accounts/' + encodeURIComponent(acc.id) + '/status');
 
   if (!r.ok) {
-    const s = r.status === 404 ? 'offline' : a.status;
+    let s = acc.status;
+    if (r.status === 404) s = 'offline';
+    if (r.status === 401) s = 'reauth_required';
     await db.q('UPDATE accounts SET status=$1, last_error=$2, last_checked_at=now() WHERE id=$3',
-      [s, r.data?.error || 'backend_' + r.status, a.id]);
-    return { ...a, status: s };
+      [s, r.data?.error || 'backend_' + r.status, acc.id]);
+    return { ...acc, status: s };
   }
 
   const reported = String(r.data?.status || 'offline');
@@ -367,9 +298,9 @@ async function sync(acc) {
 
   const upd = await db.one(
     'UPDATE accounts SET status=$1, last_error=$2, last_checked_at=now(), last_status_change=CASE WHEN status IS DISTINCT FROM $1 THEN now() ELSE last_status_change END, session_started_at=COALESCE($3::timestamptz, session_started_at), updated_at=now() WHERE id=$4 RETURNING *',
-    [s, r.data?.error || null, r.data?.sessionStartedAt || null, a.id]
+    [s, r.data?.error || null, r.data?.sessionStartedAt || null, acc.id]
   );
-  return upd || { ...a, status: s };
+  return upd || { ...acc, status: s };
 }
 
 /* ============================ routes ============================ */
@@ -427,75 +358,39 @@ app.post('/api/auth/logout', auth, csrf, async (req, res) => {
 });
 
 app.post('/api/accounts/connect', auth, csrf, actLimit, async (req, res) => {
+  const token = String(req.body?.token || '').trim().replace(/^Bearer\s+/i, '');
+  if (token.length < 30) return res.status(400).json({ error: 'Paste a valid Discord token' });
+
+  let profile;
+  try { profile = await me(token); }
+  catch { return res.status(400).json({ error: 'Discord rejected that token' }); }
+
   const { count } = await db.one('SELECT count(*)::int AS count FROM accounts WHERE user_id = $1', [req.user.id]);
-  if (count >= MAX_ACCOUNTS) return res.status(409).json({ error: 'Limit of ' + MAX_ACCOUNTS + ' accounts reached' });
-
-  const state = rand(32);
-  await db.q("INSERT INTO oauth_states (state, user_id, expires_at) VALUES ($1,$2,now() + interval '10 minutes')",
-    [sha256(state), req.user.id]);
-
-  const p = new URLSearchParams({
-    client_id: env.DISCORD_CLIENT_ID,
-    redirect_uri: env.DISCORD_REDIRECT_URI,
-    response_type: 'code',
-    scope: 'identify guilds',
-    state,
-    prompt: 'consent',
-  });
-  res.json({ authorizeUrl: 'https://discord.com/oauth2/authorize?' + p.toString() });
-});
-
-app.get('/auth/discord/callback', async (req, res) => {
-  const fail = (r) => res.redirect('/?connect=error&reason=' + encodeURIComponent(r));
-  if (!req.user) return fail('not_signed_in');
-
-  const state = String(req.query.state || '');
-  const code = String(req.query.code || '');
-  if (!state || !code) return fail('missing_parameters');
-
-  const ok = await db.one(
-    'DELETE FROM oauth_states WHERE state = $1 AND user_id = $2 AND expires_at > now() RETURNING state',
-    [sha256(state), req.user.id]);
-  if (!ok) return fail('invalid_state');
-
-  try {
-    const t = await exchange(code);
-    const p = await me(t.access_token);
-    const exp = t.expires_in ? new Date(Date.now() + Number(t.expires_in) * 1000) : null;
-
-    const existing = await db.one('SELECT id FROM accounts WHERE user_id = $1 AND discord_user_id = $2',
-      [req.user.id, p.id]);
-
-    const acc = existing
-      ? await db.one(
-        "UPDATE accounts SET username=$1, global_name=$2, avatar_url=$3, scopes=$4, access_token_enc=$5, refresh_token_enc=$6, token_expires_at=$7, status='connecting', last_error=NULL, updated_at=now() WHERE id=$8 RETURNING *",
-        [p.username, p.global_name || null, avatarUrl(p), String(t.scope || ''), encrypt(t.access_token),
-          encrypt(t.refresh_token || null), exp, existing.id])
-      : await db.one(
-        "INSERT INTO accounts (user_id, discord_user_id, username, global_name, avatar_url, scopes, access_token_enc, refresh_token_enc, token_expires_at, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'connecting') RETURNING *",
-        [req.user.id, p.id, p.username, p.global_name || null, avatarUrl(p), String(t.scope || ''),
-          encrypt(t.access_token), encrypt(t.refresh_token || null), exp]);
-
-    await db.q('INSERT INTO account_events (account_id, user_id, event) VALUES ($1,$2,$3)',
-      [acc.id, req.user.id, existing ? 'reconnected' : 'connected']);
-
-    const push = await backend('POST', '/internal/accounts/connect', {
-      accountId: acc.id,
-      accessToken: t.access_token,
-      tokenExpiresAt: exp ? exp.toISOString() : null,
-    });
-
-    if (!push.ok) {
-      await db.q("UPDATE accounts SET status='error', last_error=$1 WHERE id=$2", ['backend_' + push.status, acc.id]);
-      return fail('backend_unreachable');
-    }
-
-    await db.q("UPDATE accounts SET status='online', last_checked_at=now() WHERE id=$1", [acc.id]);
-    res.redirect('/?connect=success&account=' + encodeURIComponent(acc.username));
-  } catch (e) {
-    console.error('[callback]', e.message);
-    fail('exchange_failed');
+  const existing = await db.one(
+    'SELECT id FROM accounts WHERE user_id = $1 AND discord_user_id = $2',
+    [req.user.id, profile.id]
+  );
+  if (!existing && count >= MAX_ACCOUNTS) {
+    return res.status(409).json({ error: 'Limit of ' + MAX_ACCOUNTS + ' accounts reached' });
   }
+
+  const acc = existing
+    ? await db.one(
+      "UPDATE accounts SET username=$1, global_name=$2, avatar_url=$3, access_token_enc=$4, status='connecting', last_error=NULL, updated_at=now() WHERE id=$5 RETURNING *",
+      [profile.username, profile.global_name || null, avatarUrl(profile), encrypt(token), existing.id])
+    : await db.one(
+      "INSERT INTO accounts (user_id, discord_user_id, username, global_name, avatar_url, access_token_enc, status) VALUES ($1,$2,$3,$4,$5,$6,'connecting') RETURNING *",
+      [req.user.id, profile.id, profile.username, profile.global_name || null, avatarUrl(profile), encrypt(token)]);
+
+  const push = await backend('POST', '/internal/accounts/connect', { accountId: acc.id, token });
+
+  if (!push.ok) {
+    await db.q("UPDATE accounts SET status='error', last_error=$1 WHERE id=$2", ['backend_' + push.status, acc.id]);
+    return res.status(502).json({ error: 'Backend unreachable' });
+  }
+
+  await db.q("UPDATE accounts SET status='online', last_checked_at=now() WHERE id=$1", [acc.id]);
+  res.status(201).json({ account: pub(acc) });
 });
 
 app.get('/api/accounts', auth, async (req, res) => {
@@ -589,6 +484,15 @@ const PAGE = `<!DOCTYPE html>
 <div class="dialog__actions"><button class="btn btn--ghost" value="cancel">Cancel</button>
 <button class="btn btn--danger" value="confirm">Disconnect</button></div>
 </form></dialog>
+<dialog id="token-dialog" class="dialog"><form id="token-form" class="dialog__inner">
+<h2 class="dialog__title">Connect an account</h2>
+<p class="dialog__text">Paste the account's Discord token. It is encrypted before storage.</p>
+<textarea id="token-input" rows="4" placeholder="Paste token here" required></textarea>
+<p id="token-error" class="form-error" hidden></p>
+<div class="dialog__actions">
+<button type="button" class="btn btn--ghost" id="token-cancel">Cancel</button>
+<button type="submit" class="btn btn--primary">Connect</button></div>
+</form></dialog>
 <div id="toasts" class="toasts"></div>
 <script src="/script.js" defer></script>
 </body></html>`;
@@ -619,6 +523,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,-apple-sy
 .field__label{font-size:12.5px;font-weight:600;color:var(--text-dim)}
 input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);font:inherit;font-size:14.5px}
 input:focus{outline:none;border-color:rgba(168,85,247,.6);box-shadow:0 0 0 4px rgba(139,92,246,.12)}
+textarea{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);font:inherit;font-size:13px;resize:vertical;margin-bottom:12px}
+textarea:focus{outline:none;border-color:rgba(168,85,247,.6);box-shadow:0 0 0 4px rgba(139,92,246,.12)}
 .form-error{margin:0;padding:9px 12px;border-radius:10px;font-size:13px;color:#fecaca;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.28)}
 .topbar{position:sticky;top:0;z-index:20;border-bottom:1px solid var(--line);background:rgba(8,7,13,.82);backdrop-filter:blur(16px)}
 .topbar__inner{max-width:1120px;margin:0 auto;padding:13px 22px;display:flex;align-items:center;justify-content:space-between;gap:16px}
@@ -663,7 +569,7 @@ input:focus{outline:none;border-color:rgba(168,85,247,.6);box-shadow:0 0 0 4px r
 .dialog::backdrop{background:rgba(4,3,9,.72);backdrop-filter:blur(6px)}
 .dialog__inner{padding:26px 24px;border-radius:22px;border:1px solid var(--line-strong);background:linear-gradient(170deg,#191826,#0d0c15)}
 .dialog__title{margin:0 0 8px;font-size:18px}
-.dialog__text{margin:0 0 22px;font-size:13.5px;color:var(--text-dim)}
+.dialog__text{margin:0 0 18px;font-size:13.5px;color:var(--text-dim)}
 .dialog__text strong{color:var(--text)}
 .dialog__actions{display:flex;gap:10px}.dialog__actions .btn{flex:1}
 .toasts{position:fixed;right:18px;bottom:18px;z-index:60;display:grid;gap:10px;max-width:min(360px,calc(100vw - 36px))}
@@ -683,7 +589,7 @@ input:focus{outline:none;border-color:rgba(168,85,247,.6);box-shadow:0 0 0 4px r
 const CLIENT = `
 const state={csrfToken:null,user:null,accounts:[],limit:10,pollTimer:null,pendingDelete:null,busy:new Set()};
 const $=function(s){return document.querySelector(s)};
-const els={authView:$('#auth-view'),appView:$('#app-view'),authForm:$('#auth-form'),authEmail:$('#auth-email'),authPassword:$('#auth-password'),authError:$('#auth-error'),authSubmit:$('#auth-submit'),userEmail:$('#user-email'),signOut:$('#sign-out'),connectBtn:$('#connect-btn'),emptyConnect:$('#empty-connect'),grid:$('#accounts-grid'),empty:$('#empty-state'),statTotal:$('#stat-total'),statOnline:$('#stat-online'),statLimit:$('#stat-limit'),dialog:$('#confirm-dialog'),dialogAccount:$('#dialog-account'),toasts:$('#toasts')};
+const els={authView:$('#auth-view'),appView:$('#app-view'),authForm:$('#auth-form'),authEmail:$('#auth-email'),authPassword:$('#auth-password'),authError:$('#auth-error'),authSubmit:$('#auth-submit'),userEmail:$('#user-email'),signOut:$('#sign-out'),connectBtn:$('#connect-btn'),emptyConnect:$('#empty-connect'),grid:$('#accounts-grid'),empty:$('#empty-state'),statTotal:$('#stat-total'),statOnline:$('#stat-online'),statLimit:$('#stat-limit'),dialog:$('#confirm-dialog'),dialogAccount:$('#dialog-account'),tokenDialog:$('#token-dialog'),tokenForm:$('#token-form'),tokenInput:$('#token-input'),tokenError:$('#token-error'),tokenCancel:$('#token-cancel'),toasts:$('#toasts')};
 async function api(path,opts){
 opts=opts||{};
 var method=(opts.method||'GET').toUpperCase();
@@ -783,10 +689,22 @@ function startPoll(){
 stopPoll();
 state.pollTimer=setInterval(function(){if(!document.hidden)load(true)},20000)}
 function stopPoll(){if(state.pollTimer)clearInterval(state.pollTimer);state.pollTimer=null}
-async function connect(){
-els.connectBtn.disabled=true;
-try{var d=await api('/api/accounts/connect',{method:'POST'});window.location.assign(d.authorizeUrl)}
-catch(e){toast(e.message,'err');els.connectBtn.disabled=false}}
+function openToken(){
+els.tokenInput.value='';
+els.tokenError.hidden=true;
+els.tokenDialog.showModal();
+els.tokenInput.focus()}
+async function submitToken(e){
+e.preventDefault();
+els.tokenError.hidden=true;
+try{
+var d=await api('/api/accounts/connect',{method:'POST',body:{token:els.tokenInput.value}});
+var i=state.accounts.findIndex(function(a){return a.id===d.account.id});
+if(i>=0)state.accounts[i]=d.account;else state.accounts.unshift(d.account);
+els.tokenDialog.close();
+render();
+toast('@'+d.account.username+' connected')}
+catch(err){els.tokenError.textContent=err.message;els.tokenError.hidden=false}}
 function openConfirm(acc){state.pendingDelete=acc;els.dialogAccount.textContent='@'+acc.username;els.dialog.showModal()}
 async function doDelete(){
 var acc=state.pendingDelete;
@@ -825,28 +743,24 @@ els.signOut.onclick=async function(){
 try{await api('/api/auth/logout',{method:'POST'})}catch(e){}
 state.csrfToken=null;state.user=null;state.accounts=[];
 showAuth();toast('Signed out')};
-els.connectBtn.onclick=connect;
-els.emptyConnect.onclick=connect;
+els.connectBtn.onclick=openToken;
+els.emptyConnect.onclick=openToken;
+els.tokenForm.onsubmit=submitToken;
+els.tokenCancel.onclick=function(){els.tokenDialog.close()};
 els.dialog.addEventListener('close',function(){
 if(els.dialog.returnValue==='confirm')doDelete();else state.pendingDelete=null});
 document.addEventListener('visibilitychange',function(){if(!document.hidden&&state.user)load(true)});
 (async function boot(){
-var q=new URLSearchParams(location.search);
-var cr=q.get('connect');
 try{
 var s=await api('/api/session');
 if(!s.authenticated){showAuth();return}
-state.csrfToken=s.csrfToken;state.user=s.user;showApp();
-if(cr==='success')toast('@'+(q.get('account')||'Account')+' connected');
-else if(cr==='error')toast('Connection failed: '+((q.get('reason')||'unknown').replace(/_/g,' ')),'err');
-if(cr)history.replaceState({},'','/')}
+state.csrfToken=s.csrfToken;state.user=s.user;showApp()}
 catch(e){showAuth()}})();`;
 
 /* ============================ boot ============================ */
 
 setInterval(() => {
   pool.query('DELETE FROM sessions WHERE expires_at < now()')
-    .then(() => pool.query('DELETE FROM oauth_states WHERE expires_at < now()'))
     .catch((e) => console.error('[cleanup]', e.message));
 }, 3600000).unref();
 
