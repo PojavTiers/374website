@@ -1,0 +1,12 @@
+{
+  "name": "instaname-finder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Instagram username idea generator with a third-party availability checker backend",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
