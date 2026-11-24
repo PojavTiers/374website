@@ -1,3 +1,4 @@
+// automation/package.json
 {
   "name": "discord-automation",
   "private": true,
@@ -5,7 +6,7 @@
   "engines": { "node": ">=20" },
   "scripts": { "start": "node index.js" },
   "dependencies": {
-    "discord.js": "^14.16.3",
+    "discord.js-selfbot-v13": "^3.3.0",
     "express": "^4.21.2"
   }
 }
